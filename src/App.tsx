@@ -1,40 +1,147 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
-const GREEN = "#22C55E", RED = "#EF4444", WHITE = "#FFFFFF";
+const GREEN = "#22C55E", RED = "#EF4444", WHITE = "#FFFFFF", YELLOW = "#F59E0B";
 const BORDER = "#1E1E1E", BG = "#000000", SURFACE = "#0C0C0C";
 const FONT_URL = "https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&display=swap";
-const STORAGE_KEY = "reserve_demo_v2";
+const STORAGE_KEY = "reserve_demo_v3";
 const LOGO_KEY = "reserve_demo_logo_v2";
 
-interface RepData { name: string; calls: number; shows: number; closes: number; revenue: number; installment: number; }
+const REP_NAMES = ["Marcus","Devon","Kayla","Jordan","Tyler","Raine","Brian","Ash","Scott","Devin"];
+
+interface RepData { name: string; calls: number; shows: number; closes: number; revenue: number; installment: number; tier: "top"|"mid"|"low"; }
 interface DashData {
   agencyName: string; clientName: string; monthlyGoal: number; currentCash: number;
   installments: number; totalCalls: number; showUps: number; noShows: number;
   closes: number; avgDeal: number; dayOfMonth: number; totalDaysInMonth: number;
   reps: RepData[]; trendCloses: number[]; trendCash: number[]; month: string; year: number;
+  showRate: number; closeRate: number;
+}
+
+interface CalcInputs {
+  totalCash: string; showRate: string; closeRate: string; avgDeal: string;
+  installmentPct: string; numReps: string; monthlyGoal: string; dayOfMonth: string; totalDaysInMonth: string;
+  month: string; year: string; agencyName: string; clientName: string;
 }
 
 const DEFAULT: DashData = {
   agencyName: "Apex Media Group", clientName: "Jordan Williams",
   monthlyGoal: 110000, currentCash: 78400, installments: 12000,
   totalCalls: 142, showUps: 98, noShows: 44, closes: 18, avgDeal: 6000,
+  showRate: 69, closeRate: 18,
   dayOfMonth: 21, totalDaysInMonth: 31,
   reps: [
-    { name: "Marcus", calls: 58, shows: 42, closes: 9, revenue: 38400, installment: 6000 },
-    { name: "Devon", calls: 47, shows: 31, closes: 6, revenue: 24000, installment: 4000 },
-    { name: "Kayla", calls: 37, shows: 25, closes: 3, revenue: 16000, installment: 2000 },
+    { name: "Marcus", calls: 58, shows: 42, closes: 9, revenue: 38400, installment: 6000, tier: "top" },
+    { name: "Devon", calls: 47, shows: 31, closes: 6, revenue: 24000, installment: 4000, tier: "mid" },
+    { name: "Kayla", calls: 37, shows: 25, closes: 3, revenue: 16000, installment: 2000, tier: "low" },
   ],
   trendCloses: [1,2,1,3,2,1,2,2,3,1],
   trendCash: [6000,12000,6000,18000,12000,6000,12000,12000,18000,6000],
   month: "March", year: 2026,
 };
 
-function encodeData(d: DashData): string {
-  try { return btoa(encodeURIComponent(JSON.stringify(d))); } catch { return ""; }
+const DEFAULT_CALC: CalcInputs = {
+  totalCash: "78400", showRate: "69", closeRate: "18", avgDeal: "6000",
+  installmentPct: "13", numReps: "", monthlyGoal: "110000",
+  dayOfMonth: "21", totalDaysInMonth: "31", month: "March", year: "2026",
+  agencyName: "Apex Media Group", clientName: "Jordan Williams",
+};
+
+const TIER_WEIGHTS: Record<number, number[]> = {
+  1: [1],
+  2: [0.62, 0.38],
+  3: [0.52, 0.31, 0.17],
+  4: [0.42, 0.28, 0.20, 0.10],
+  5: [0.38, 0.26, 0.18, 0.12, 0.06],
+  6: [0.34, 0.24, 0.18, 0.13, 0.08, 0.03],
+};
+const TIER_LABELS: Record<number, ("top"|"mid"|"low")[]> = {
+  1: ["top"],
+  2: ["top","low"],
+  3: ["top","mid","low"],
+  4: ["top","top","mid","low"],
+  5: ["top","top","mid","low","low"],
+  6: ["top","top","mid","mid","low","low"],
+};
+
+function autoRepCount(totalCalls: number, daysElapsed: number, manualOverride: string): { repCount: number; callsPerRepPerDay: number; autoSet: boolean } {
+  const manualVal = parseInt(manualOverride);
+  const callsPerDay = totalCalls / Math.max(daysElapsed, 1);
+  let bestRepCount = 3;
+  let bestRemainder = Infinity;
+  for (const target of [8, 9, 10]) {
+    const rawReps = callsPerDay / target;
+    const rounded = Math.min(Math.max(Math.round(rawReps), 1), 6);
+    const remainder = Math.abs(rawReps - rounded);
+    if (remainder < bestRemainder) { bestRemainder = remainder; bestRepCount = rounded; }
+  }
+  const finalReps = isNaN(manualVal) ? bestRepCount : Math.min(Math.max(manualVal, 1), 6);
+  const actualCallsPerRepPerDay = callsPerDay / finalReps;
+  return { repCount: finalReps, callsPerRepPerDay: Math.round(actualCallsPerRepPerDay * 10) / 10, autoSet: isNaN(manualVal) };
 }
-function decodeData(s: string): DashData | null {
-  try { return { ...DEFAULT, ...JSON.parse(decodeURIComponent(atob(s))) }; } catch { return null; }
+
+function generateReps(closes: number, avgDeal: number, installmentPct: number, showRate: number, closeRate: number, numReps: number): RepData[] {
+  const n = Math.min(Math.max(numReps, 1), 6);
+  const weights = TIER_WEIGHTS[n] || TIER_WEIGHTS[3];
+  const tiers = TIER_LABELS[n] || TIER_LABELS[3];
+  const totalRevenue = closes * avgDeal;
+  const totalInstallments = Math.round(totalRevenue * (installmentPct / 100));
+  const totalShows = closeRate > 0 ? Math.round(closes / (closeRate / 100)) : closes * 4;
+  const totalCalls = showRate > 0 ? Math.round(totalShows / (showRate / 100)) : totalShows * 2;
+  return weights.map((w, i) => ({
+    name: REP_NAMES[i] || `Rep ${i+1}`,
+    calls: Math.max(1, Math.round(totalCalls * w)),
+    shows: Math.max(1, Math.round(totalShows * w)),
+    closes: Math.max(1, Math.round(closes * w)),
+    revenue: Math.round(totalRevenue * w),
+    installment: Math.round(totalInstallments * w),
+    tier: tiers[i],
+  }));
 }
+
+function generateTrends(closes: number, avgDeal: number, dayOfMonth: number): { trendCloses: number[]; trendCash: number[] } {
+  const avgClosesPerDay = closes / Math.max(dayOfMonth, 1);
+  const trendCloses: number[] = [];
+  const trendCash: number[] = [];
+  for (let i = 0; i < 10; i++) {
+    const variance = 0.4 + Math.random() * 1.2;
+    const c = Math.max(0, Math.round(avgClosesPerDay * variance));
+    trendCloses.push(c);
+    trendCash.push(c * avgDeal);
+  }
+  return { trendCloses, trendCash };
+}
+
+function calculate(inputs: CalcInputs): DashData {
+  const totalCash = parseFloat(inputs.totalCash) || 0;
+  const showRate = parseFloat(inputs.showRate) || 70;
+  const closeRate = parseFloat(inputs.closeRate) || 25;
+  const avgDeal = parseFloat(inputs.avgDeal) || 6000;
+  const installmentPct = parseFloat(inputs.installmentPct) || 13;
+  const monthlyGoal = parseFloat(inputs.monthlyGoal) || 110000;
+  const dayOfMonth = parseInt(inputs.dayOfMonth) || 15;
+  const totalDaysInMonth = parseInt(inputs.totalDaysInMonth) || 31;
+  const daysElapsed = Math.max(dayOfMonth - 1, 1);
+  const installments = Math.round(totalCash * (installmentPct / 100));
+  const newCash = totalCash - installments;
+  const closes = avgDeal > 0 ? Math.round(newCash / avgDeal) : 0;
+  const showUps = closeRate > 0 ? Math.round(closes / (closeRate / 100)) : closes * 4;
+  const totalCalls = showRate > 0 ? Math.round(showUps / (showRate / 100)) : showUps * 2;
+  const noShows = totalCalls - showUps;
+  const { repCount } = autoRepCount(totalCalls, daysElapsed, inputs.numReps);
+  const reps = generateReps(closes, avgDeal, installmentPct, showRate, closeRate, repCount);
+  const { trendCloses, trendCash } = generateTrends(closes, avgDeal, dayOfMonth);
+  return {
+    agencyName: inputs.agencyName || DEFAULT.agencyName,
+    clientName: inputs.clientName || DEFAULT.clientName,
+    monthlyGoal, currentCash: newCash, installments, totalCalls, showUps, noShows,
+    closes, avgDeal, showRate: Math.round(showRate), closeRate: Math.round(closeRate),
+    dayOfMonth, totalDaysInMonth, reps, trendCloses, trendCash,
+    month: inputs.month || "March", year: parseInt(inputs.year) || 2026,
+  };
+}
+
+function encodeData(d: DashData): string { try { return btoa(encodeURIComponent(JSON.stringify(d))); } catch { return ""; } }
+function decodeData(s: string): DashData | null { try { return { ...DEFAULT, ...JSON.parse(decodeURIComponent(atob(s))) }; } catch { return null; } }
 function loadData(): DashData {
   const params = new URLSearchParams(window.location.search);
   const shared = params.get("d");
@@ -44,7 +151,6 @@ function loadData(): DashData {
 function saveData(d: DashData) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(d)); } catch {} }
 function loadLogo(): string { try { return localStorage.getItem(LOGO_KEY) || ""; } catch { return ""; } }
 function saveLogo(v: string) { try { localStorage.setItem(LOGO_KEY, v); } catch {} }
-
 function money(n: number) { return "$" + Math.round(n).toLocaleString("en-US"); }
 function pct(a: number, b: number) { return b ? Math.round((a / b) * 100) : 0; }
 function num(v: string) { const n = parseFloat(v.replace(/[^0-9.-]/g, "")); return isNaN(n) ? 0 : n; }
@@ -59,7 +165,7 @@ function SparkBars({ data, color = GREEN }: { data: number[]; color?: string }) 
   const max = Math.max(...data, 1);
   return (
     <div style={{ display: "flex", gap: 4, alignItems: "flex-end", height: 40 }}>
-      {data.map((v, i) => <div key={i} style={{ flex: 1, background: i === data.length - 1 ? color : color + "33", borderRadius: 3, height: `${Math.max((v / max) * 100, 5)}%`, transition: "height 0.5s ease" }} />)}
+      {data.map((v, i) => <div key={i} style={{ flex: 1, background: i === data.length - 1 ? color : color + "33", borderRadius: 3, height: `${Math.max((v / max) * 100, 5)}%` }} />)}
     </div>
   );
 }
@@ -74,38 +180,50 @@ function KpiCard({ label, value, sub, color }: { label: string; value: string | 
   );
 }
 
-function EditField({ label, value, onChange, prefix = "", type = "text", wide = false, small = false }: {
+function CalcField({ label, value, onChange, prefix = "", suffix = "", hint = "", placeholder = "" }: {
+  label: string; value: string; onChange: (v: string) => void;
+  prefix?: string; suffix?: string; hint?: string; placeholder?: string;
+}) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+      <div style={{ fontSize: 8, color: "#888", letterSpacing: "0.12em", fontFamily: "'DM Mono'" }}>{label}</div>
+      <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+        {prefix && <span style={{ fontSize: 11, color: "#555", fontFamily: "'DM Mono'" }}>{prefix}</span>}
+        <input value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder}
+          style={{ background: "#080808", border: `1px solid ${GREEN}55`, color: WHITE, borderRadius: 7, padding: "8px 12px", fontSize: 13, fontFamily: "'DM Mono'", outline: "none", width: "100%", fontWeight: 500 }}
+          onFocus={e => { e.target.style.borderColor = GREEN; e.target.style.boxShadow = `0 0 0 2px ${GREEN}18`; }}
+          onBlur={e => { e.target.style.borderColor = GREEN + "55"; e.target.style.boxShadow = "none"; }} />
+        {suffix && <span style={{ fontSize: 11, color: "#555", fontFamily: "'DM Mono'" }}>{suffix}</span>}
+      </div>
+      {hint && <div style={{ fontSize: 8, color: "#444", fontFamily: "'DM Mono'" }}>{hint}</div>}
+    </div>
+  );
+}
+
+function EditField({ label, value, onChange, prefix = "", wide = false, small = false }: {
   label: string; value: string | number; onChange: (v: string) => void;
-  prefix?: string; type?: string; wide?: boolean; small?: boolean;
+  prefix?: string; wide?: boolean; small?: boolean;
 }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
       <div style={{ fontSize: 8, color: "#666", letterSpacing: "0.12em", fontFamily: "'DM Mono'" }}>{label}</div>
       <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
         {prefix && <span style={{ fontSize: 11, color: "#555", fontFamily: "'DM Mono'" }}>{prefix}</span>}
-        <input value={value} onChange={e => onChange(e.target.value)} type={type}
-          style={{ background: "#0a0a0a", border: `1px solid ${GREEN}44`, color: WHITE, borderRadius: 6, padding: "6px 10px", fontSize: 11, fontFamily: "'DM Mono'", outline: "none", width: wide ? "100%" : small ? "70px" : "90px" }}
+        <input value={value} onChange={e => onChange(e.target.value)}
+          style={{ background: "#0a0a0a", border: `1px solid ${GREEN}33`, color: WHITE, borderRadius: 6, padding: "6px 10px", fontSize: 11, fontFamily: "'DM Mono'", outline: "none", width: wide ? "100%" : small ? "70px" : "90px" }}
           onFocus={e => e.target.style.borderColor = GREEN}
-          onBlur={e => e.target.style.borderColor = GREEN + "44"} />
+          onBlur={e => e.target.style.borderColor = GREEN + "33"} />
       </div>
-    </div>
-  );
-}
-
-function TrendEditor({ label, values, onChange }: { label: string; values: number[]; onChange: (v: number[]) => void }) {
-  return (
-    <div>
-      <div style={{ fontSize: 8, color: "#666", letterSpacing: "0.12em", fontFamily: "'DM Mono'", marginBottom: 6 }}>{label} (10 values, comma separated)</div>
-      <input value={values.join(",")} onChange={e => onChange(e.target.value.split(",").map(v => num(v.trim())).slice(0, 10))}
-        style={{ background: "#0a0a0a", border: `1px solid ${GREEN}44`, color: WHITE, borderRadius: 6, padding: "6px 10px", fontSize: 11, fontFamily: "'DM Mono'", outline: "none", width: "100%" }} />
     </div>
   );
 }
 
 export default function ReserveDemoDashboard() {
   const [data, setData] = useState<DashData>(loadData);
+  const [calcInputs, setCalcInputs] = useState<CalcInputs>(DEFAULT_CALC);
   const [logo, setLogo] = useState<string>(loadLogo);
   const [editMode, setEditMode] = useState(false);
+  const [activeTab, setActiveTab] = useState<"calculator"|"manual">("calculator");
   const [fullscreen, setFullscreen] = useState(false);
   const [toast, setToast] = useState(""); const [toastVisible, setToastVisible] = useState(false);
   const [copySuccess, setCopySuccess] = useState(false);
@@ -118,10 +236,8 @@ export default function ReserveDemoDashboard() {
     const link = document.createElement("link"); link.rel = "stylesheet"; link.href = FONT_URL;
     document.head.appendChild(link);
   }, []);
-
   useEffect(() => { saveData(data); }, [data]);
   useEffect(() => { saveLogo(logo); }, [logo]);
-
   useEffect(() => {
     const handler = () => { if (!document.fullscreenElement) setFullscreen(false); };
     document.addEventListener("fullscreenchange", handler);
@@ -131,9 +247,7 @@ export default function ReserveDemoDashboard() {
   function toggleFullscreen() {
     if (!document.fullscreenElement) {
       containerRef.current?.requestFullscreen().then(() => setFullscreen(true)).catch(() => setFullscreen(true));
-    } else {
-      document.exitFullscreen().then(() => setFullscreen(false));
-    }
+    } else { document.exitFullscreen().then(() => setFullscreen(false)); }
   }
 
   function showToast(msg: string) {
@@ -142,9 +256,34 @@ export default function ReserveDemoDashboard() {
     toastRef.current = setTimeout(() => setToastVisible(false), 2800);
   }
 
+  function updateCalc(patch: Partial<CalcInputs>) { setCalcInputs(c => ({ ...c, ...patch })); }
+
+  const liveRepPreview = (() => {
+    const sr = parseFloat(calcInputs.showRate) || 70;
+    const cr = parseFloat(calcInputs.closeRate) || 25;
+    const tc = parseFloat(calcInputs.totalCash) || 0;
+    const ip = parseFloat(calcInputs.installmentPct) || 13;
+    const ad = parseFloat(calcInputs.avgDeal) || 6000;
+    const day = parseInt(calcInputs.dayOfMonth) || 15;
+    const daysElapsed = Math.max(day - 1, 1);
+    const nc = tc * (1 - ip / 100);
+    const closes = Math.round(nc / ad);
+    const shows = Math.round(closes / (cr / 100));
+    const calls = Math.round(shows / (sr / 100));
+    return autoRepCount(calls, daysElapsed, calcInputs.numReps);
+  })();
+
+  function runCalculate() {
+    const updatedInputs = { ...calcInputs, numReps: String(liveRepPreview.repCount) };
+    setCalcInputs(updatedInputs);
+    const result = calculate(updatedInputs);
+    setData(result);
+    showToast(`Dashboard generated — ${liveRepPreview.repCount} reps @ ${liveRepPreview.callsPerRepPerDay} calls/day`);
+  }
+
   function update(patch: Partial<DashData>) { setData(d => ({ ...d, ...patch })); }
   function updateRep(i: number, patch: Partial<RepData>) { setData(d => { const reps = [...d.reps]; reps[i] = { ...reps[i], ...patch }; return { ...d, reps }; }); }
-  function addRep() { setData(d => ({ ...d, reps: [...d.reps, { name: "New Rep", calls: 0, shows: 0, closes: 0, revenue: 0, installment: 0 }] })); }
+  function addRep() { setData(d => ({ ...d, reps: [...d.reps, { name: "New Rep", calls: 0, shows: 0, closes: 0, revenue: 0, installment: 0, tier: "mid" }] })); }
   function removeRep(i: number) { setData(d => ({ ...d, reps: d.reps.filter((_, idx) => idx !== i) })); }
 
   function handleShareLink() {
@@ -175,12 +314,17 @@ export default function ReserveDemoDashboard() {
     const file = e.dataTransfer.files[0]; if (file) handleLogoFile(file);
   }
 
-  function resetAll() { if (confirm("Reset everything to demo defaults?")) { setData(DEFAULT); setLogo(""); showToast("Reset to defaults"); } }
+  function resetAll() {
+    if (confirm("Reset everything to demo defaults?")) {
+      setData(DEFAULT); setCalcInputs(DEFAULT_CALC); setLogo("");
+      showToast("Reset to defaults");
+    }
+  }
 
   const totalCash = data.currentCash + data.installments;
   const monthPct = pct(totalCash, data.monthlyGoal);
-  const showRate = pct(data.showUps, data.totalCalls);
-  const closeRate = pct(data.closes, data.showUps);
+  const showRate = data.showRate || pct(data.showUps, data.totalCalls);
+  const closeRate = data.closeRate || pct(data.closes, data.showUps);
   const daysElapsed = Math.max(data.dayOfMonth - 1, 1);
   const daysRemaining = Math.max(data.totalDaysInMonth - data.dayOfMonth + 1, 1);
   const dailyActual = totalCash / daysElapsed;
@@ -194,15 +338,24 @@ export default function ReserveDemoDashboard() {
   const callsPerClose = data.closes > 0 ? (data.totalCalls / data.closes).toFixed(1) : "—";
   const closesNeeded = Math.max(0, Math.ceil((data.monthlyGoal - totalCash) / data.avgDeal));
   const maxRepRev = Math.max(...data.reps.map(r => r.revenue + r.installment), 1);
+  const tierColor = (t: string) => t === "top" ? GREEN : t === "mid" ? YELLOW : "#666";
+  const tierLabel = (t: string) => t === "top" ? "TOP" : t === "mid" ? "AVG" : "LOW";
 
   const btnStyle = (active = false, danger = false): React.CSSProperties => ({
     background: active ? WHITE : "transparent",
     border: `1px solid ${danger ? RED + "44" : active ? WHITE : BORDER}`,
     color: active ? BG : danger ? RED : WHITE,
     borderRadius: 6, padding: "4px 12px", fontSize: 9, cursor: "pointer",
-    fontFamily: "'DM Mono'", letterSpacing: "0.1em", fontWeight: active ? 700 : 400,
-    transition: "all 0.15s",
+    fontFamily: "'DM Mono'", letterSpacing: "0.1em", fontWeight: active ? 700 : 400, transition: "all 0.15s",
   });
+
+  // Live preview values
+  const prevSr = parseFloat(calcInputs.showRate)||70, prevCr = parseFloat(calcInputs.closeRate)||25;
+  const prevTc = parseFloat(calcInputs.totalCash)||0, prevIp = parseFloat(calcInputs.installmentPct)||13;
+  const prevAd = parseFloat(calcInputs.avgDeal)||6000;
+  const prevCloses = Math.round(prevTc*(1-prevIp/100)/prevAd);
+  const prevShows = Math.round(prevCloses/(prevCr/100));
+  const prevCalls = Math.round(prevShows/(prevSr/100));
 
   return (
     <div ref={containerRef} style={{ fontFamily: "'DM Mono', monospace", background: BG, minHeight: "100vh", color: WHITE, position: fullscreen ? "fixed" : "relative", inset: fullscreen ? 0 : "auto", zIndex: fullscreen ? 9999 : "auto", overflowY: "auto" }}>
@@ -210,6 +363,7 @@ export default function ReserveDemoDashboard() {
         @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
         @keyframes up { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
         @keyframes slideDown { from{opacity:0;transform:translateY(-8px)} to{opacity:1;transform:translateY(0)} }
+        @keyframes pulse { 0%,100%{box-shadow:0 0 0 0 ${GREEN}44} 70%{box-shadow:0 0 0 8px transparent} }
         .fade { animation: up 0.35s ease both; }
         input::placeholder { color: #333; }
         .logo-drop:hover { border-color: ${GREEN}88 !important; }
@@ -262,80 +416,177 @@ export default function ReserveDemoDashboard() {
         <div style={{ background: GREEN + "0d", borderBottom: `1px solid ${GREEN}22`, padding: "9px 24px", display: "flex", alignItems: "center", gap: 10, animation: "slideDown 0.2s ease" }}>
           <div style={{ width: 5, height: 5, borderRadius: "50%", background: GREEN, animation: "blink 1.2s ease infinite" }} />
           <span style={{ fontSize: 9, color: GREEN, letterSpacing: "0.14em" }}>EDIT MODE ACTIVE</span>
-          <span style={{ fontSize: 9, color: "#444", marginLeft: 4 }}>All changes save to your browser automatically · Click DONE EDITING to present</span>
+          <span style={{ fontSize: 9, color: "#444", marginLeft: 4 }}>Use the Calculator tab to auto-fill everything, or Manual tab to edit individual fields</span>
         </div>
       )}
 
       <div style={{ padding: "20px 24px", display: "flex", flexDirection: "column", gap: 14 }}>
+
         {editMode && (
-          <div className="fade" style={{ background: SURFACE, border: `1px solid ${GREEN}22`, borderRadius: 14, padding: "24px 26px", display: "flex", flexDirection: "column", gap: 20 }}>
-            <div>
-              <div style={{ fontSize: 9, color: GREEN, letterSpacing: "0.14em", marginBottom: 14 }}>LOGO</div>
-              <div className="logo-drop" onDragOver={e => { e.preventDefault(); setIsDragging(true); }} onDragLeave={() => setIsDragging(false)} onDrop={handleDrop} onClick={() => fileInputRef.current?.click()}
-                style={{ border: `1px dashed ${isDragging ? GREEN : BORDER}`, borderRadius: 10, padding: "18px 24px", cursor: "pointer", display: "flex", alignItems: "center", gap: 16, background: isDragging ? GREEN + "08" : "transparent", transition: "all 0.2s", width: "fit-content" }}>
-                {logo ? <img src={logo} alt="logo" style={{ height: 36, maxWidth: 140, objectFit: "contain", borderRadius: 4 }} /> : <div style={{ width: 36, height: 36, borderRadius: 8, background: "#111", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>⬡</div>}
+          <div className="fade" style={{ background: SURFACE, border: `1px solid ${GREEN}22`, borderRadius: 14, overflow: "hidden" }}>
+            <div style={{ display: "flex", borderBottom: `1px solid ${BORDER}` }}>
+              {(["calculator", "manual"] as const).map(tab => (
+                <button key={tab} onClick={() => setActiveTab(tab)} style={{ flex: 1, padding: "14px 20px", background: activeTab === tab ? GREEN + "10" : "transparent", border: "none", borderBottom: activeTab === tab ? `2px solid ${GREEN}` : "2px solid transparent", color: activeTab === tab ? GREEN : "#555", fontSize: 9, letterSpacing: "0.14em", cursor: "pointer", fontFamily: "'DM Mono'", fontWeight: activeTab === tab ? 700 : 400, transition: "all 0.15s" }}>
+                  {tab === "calculator" ? "⚡ SMART CALCULATOR" : "✎ MANUAL EDIT"}
+                </button>
+              ))}
+            </div>
+
+            {activeTab === "calculator" && (
+              <div style={{ padding: "24px 26px", display: "flex", flexDirection: "column", gap: 20 }}>
                 <div>
-                  <div style={{ fontSize: 10, color: WHITE, fontFamily: "'DM Mono'", marginBottom: 3 }}>{logo ? "Click or drag to replace logo" : "Click or drag to upload logo"}</div>
-                  <div style={{ fontSize: 9, color: "#555", fontFamily: "'DM Mono'" }}>PNG, JPG, SVG · max 2MB</div>
+                  <div style={{ fontSize: 11, color: WHITE, fontFamily: "'Syne', sans-serif", fontWeight: 700, marginBottom: 3 }}>Enter your numbers — we'll build the whole dashboard</div>
+                  <div style={{ fontSize: 9, color: "#555" }}>Rep count auto-calculates from call volume (8–10 calls/rep/day). Bell curve distribution applied automatically.</div>
                 </div>
-                <input ref={fileInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={e => { const f = e.target.files?.[0]; if (f) handleLogoFile(f); }} />
-              </div>
-            </div>
-            <div style={{ height: 1, background: BORDER }} />
-            <div>
-              <div style={{ fontSize: 9, color: GREEN, letterSpacing: "0.14em", marginBottom: 14 }}>CORE NUMBERS</div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(8, 1fr)", gap: 14 }}>
-                <EditField label="MONTHLY GOAL" value={data.monthlyGoal} onChange={v => update({ monthlyGoal: num(v) })} prefix="$" />
-                <EditField label="NEW CASH" value={data.currentCash} onChange={v => update({ currentCash: num(v) })} prefix="$" />
-                <EditField label="INSTALLMENTS" value={data.installments} onChange={v => update({ installments: num(v) })} prefix="$" />
-                <EditField label="AVG DEAL" value={data.avgDeal} onChange={v => update({ avgDeal: num(v) })} prefix="$" />
-                <EditField label="TOTAL CALLS" value={data.totalCalls} onChange={v => update({ totalCalls: num(v) })} />
-                <EditField label="SHOW UPS" value={data.showUps} onChange={v => update({ showUps: num(v) })} />
-                <EditField label="NO SHOWS" value={data.noShows} onChange={v => update({ noShows: num(v) })} />
-                <EditField label="CLOSES" value={data.closes} onChange={v => update({ closes: num(v) })} />
-              </div>
-            </div>
-            <div style={{ height: 1, background: BORDER }} />
-            <div>
-              <div style={{ fontSize: 9, color: GREEN, letterSpacing: "0.14em", marginBottom: 14 }}>TIME & LABELS</div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 14 }}>
-                <EditField label="DAY OF MONTH" value={data.dayOfMonth} onChange={v => update({ dayOfMonth: num(v) })} small />
-                <EditField label="DAYS IN MONTH" value={data.totalDaysInMonth} onChange={v => update({ totalDaysInMonth: num(v) })} small />
-                <EditField label="MONTH NAME" value={data.month} onChange={v => update({ month: v })} />
-                <EditField label="YEAR" value={data.year} onChange={v => update({ year: num(v) })} small />
-              </div>
-            </div>
-            <div style={{ height: 1, background: BORDER }} />
-            <div>
-              <div style={{ fontSize: 9, color: GREEN, letterSpacing: "0.14em", marginBottom: 14 }}>TREND CHARTS</div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
-                <TrendEditor label="DAILY CLOSES" values={data.trendCloses} onChange={v => update({ trendCloses: v })} />
-                <TrendEditor label="DAILY CASH ($)" values={data.trendCash} onChange={v => update({ trendCash: v })} />
-              </div>
-            </div>
-            <div style={{ height: 1, background: BORDER }} />
-            <div>
-              <div style={{ fontSize: 9, color: GREEN, letterSpacing: "0.14em", marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <span>REP DATA</span>
-                <button onClick={addRep} style={{ background: GREEN + "18", border: `1px solid ${GREEN}44`, color: GREEN, borderRadius: 6, padding: "4px 12px", fontSize: 9, cursor: "pointer", fontFamily: "'DM Mono'", letterSpacing: "0.08em" }}>+ ADD REP</button>
-              </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {data.reps.map((rep, i) => (
-                  <div key={i} style={{ display: "grid", gridTemplateColumns: "170px repeat(5,1fr) 28px", gap: 10, alignItems: "end", padding: "12px 14px", background: "#070707", borderRadius: 8, border: `1px solid ${BORDER}` }}>
-                    <EditField label="REP NAME" value={rep.name} onChange={v => updateRep(i, { name: v })} wide />
-                    <EditField label="CALLS" value={rep.calls} onChange={v => updateRep(i, { calls: num(v) })} />
-                    <EditField label="SHOWS" value={rep.shows} onChange={v => updateRep(i, { shows: num(v) })} />
-                    <EditField label="CLOSES" value={rep.closes} onChange={v => updateRep(i, { closes: num(v) })} />
-                    <EditField label="NEW CASH $" value={rep.revenue} onChange={v => updateRep(i, { revenue: num(v) })} />
-                    <EditField label="INSTALLMENT $" value={rep.installment} onChange={v => updateRep(i, { installment: num(v) })} />
-                    <button onClick={() => removeRep(i)} style={{ background: "transparent", border: `1px solid ${RED}22`, color: RED, borderRadius: 5, padding: "6px 4px", fontSize: 10, cursor: "pointer", height: 32, marginBottom: 0 }}>✕</button>
+
+                <div
+                  className="logo-drop"
+                  onDragOver={e => { e.preventDefault(); setIsDragging(true); }}
+                  onDragLeave={() => setIsDragging(false)}
+                  onDrop={handleDrop}
+                  onClick={() => fileInputRef.current?.click()}
+                  style={{ border: `1px dashed ${isDragging ? GREEN : BORDER}`, borderRadius: 10, padding: "12px 20px", cursor: "pointer", display: "flex", alignItems: "center", gap: 12, background: isDragging ? GREEN + "08" : "transparent", transition: "all 0.2s", width: "fit-content" }}>
+                  {logo ? <img src={logo} alt="logo" style={{ height: 28, maxWidth: 120, objectFit: "contain", borderRadius: 4 }} /> : <div style={{ width: 28, height: 28, borderRadius: 6, background: "#111", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14 }}>⬡</div>}
+                  <div style={{ fontSize: 9, color: "#555", fontFamily: "'DM Mono'" }}>{logo ? "Replace logo" : "Upload logo"} · PNG/JPG/SVG</div>
+                  <input ref={fileInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={e => { const f = e.target.files?.[0]; if (f) handleLogoFile(f); }} />
+                </div>
+
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 14 }}>
+                  <CalcField label="AGENCY NAME" value={calcInputs.agencyName} onChange={v => updateCalc({ agencyName: v })} />
+                  <CalcField label="CLIENT NAME" value={calcInputs.clientName} onChange={v => updateCalc({ clientName: v })} />
+                  <CalcField label="MONTH" value={calcInputs.month} onChange={v => updateCalc({ month: v })} />
+                  <CalcField label="YEAR" value={calcInputs.year} onChange={v => updateCalc({ year: v })} />
+                </div>
+
+                <div style={{ height: 1, background: BORDER }} />
+
+                <div>
+                  <div style={{ fontSize: 9, color: GREEN, letterSpacing: "0.14em", marginBottom: 14 }}>PERFORMANCE NUMBERS</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 }}>
+                    <CalcField label="TOTAL CASH COLLECTED" value={calcInputs.totalCash} onChange={v => updateCalc({ totalCash: v })} prefix="$" hint="New cash + installments combined" />
+                    <CalcField label="SHOW RATE" value={calcInputs.showRate} onChange={v => updateCalc({ showRate: v })} suffix="%" hint="% of booked calls that show up" />
+                    <CalcField label="CLOSE RATE" value={calcInputs.closeRate} onChange={v => updateCalc({ closeRate: v })} suffix="%" hint="% of shows that close" />
+                    <CalcField label="AVG DEAL SIZE" value={calcInputs.avgDeal} onChange={v => updateCalc({ avgDeal: v })} prefix="$" hint="Average new cash per close" />
                   </div>
-                ))}
+                </div>
+
+                <div style={{ height: 1, background: BORDER }} />
+
+                <div>
+                  <div style={{ fontSize: 9, color: GREEN, letterSpacing: "0.14em", marginBottom: 14 }}>GOAL & TIME</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 14 }}>
+                    <CalcField label="MONTHLY GOAL" value={calcInputs.monthlyGoal} onChange={v => updateCalc({ monthlyGoal: v })} prefix="$" />
+                    <CalcField label="DAY OF MONTH" value={calcInputs.dayOfMonth} onChange={v => updateCalc({ dayOfMonth: v })} hint="Current day" />
+                    <CalcField label="DAYS IN MONTH" value={calcInputs.totalDaysInMonth} onChange={v => updateCalc({ totalDaysInMonth: v })} />
+                    <CalcField label="INSTALLMENT %" value={calcInputs.installmentPct} onChange={v => updateCalc({ installmentPct: v })} suffix="%" hint="% of total cash that's installments" />
+                    <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                      <div style={{ fontSize: 8, color: "#888", letterSpacing: "0.12em", fontFamily: "'DM Mono'" }}>NUMBER OF REPS</div>
+                      <input value={calcInputs.numReps} onChange={e => updateCalc({ numReps: e.target.value })} placeholder={String(liveRepPreview.repCount)}
+                        style={{ background: "#080808", border: `1px solid ${GREEN}55`, color: WHITE, borderRadius: 7, padding: "8px 12px", fontSize: 13, fontFamily: "'DM Mono'", outline: "none", width: "100%", fontWeight: 500 }}
+                        onFocus={e => { e.target.style.borderColor = GREEN; e.target.style.boxShadow = `0 0 0 2px ${GREEN}18`; }}
+                        onBlur={e => { e.target.style.borderColor = GREEN + "55"; e.target.style.boxShadow = "none"; }} />
+                      <div style={{ fontSize: 8, color: GREEN, fontFamily: "'DM Mono'", display: "flex", alignItems: "center", gap: 5 }}>
+                        <span style={{ background: GREEN + "18", border: `1px solid ${GREEN}33`, borderRadius: 4, padding: "1px 6px" }}>AUTO: {liveRepPreview.repCount}</span>
+                        <span style={{ color: "#444" }}>{liveRepPreview.callsPerRepPerDay}/day</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{ background: "#060606", border: `1px solid ${BORDER}`, borderRadius: 10, padding: "16px 20px" }}>
+                  <div style={{ fontSize: 9, color: "#444", letterSpacing: "0.12em", marginBottom: 10 }}>WILL AUTO-CALCULATE →</div>
+                  <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
+                    {([
+                      ["Total Calls", prevCalls],
+                      ["Show Ups", prevShows],
+                      ["Closes", prevCloses],
+                      ["New Cash", money(Math.round(prevTc*(1-prevIp/100)))],
+                      ["Installments", money(Math.round(prevTc*(prevIp/100)))],
+                      [`${liveRepPreview.repCount} Reps`, `${liveRepPreview.callsPerRepPerDay} calls/rep/day`],
+                    ] as [string, string|number][]).map(([k, v]) => (
+                      <div key={k}>
+                        <div style={{ fontSize: 8, color: "#444", letterSpacing: "0.1em", marginBottom: 3 }}>{k}</div>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: GREEN, fontFamily: "'Syne', sans-serif" }}>{v}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <button onClick={runCalculate} style={{ background: GREEN, border: "none", color: BG, borderRadius: 9, padding: "14px 28px", fontSize: 12, cursor: "pointer", fontFamily: "'DM Mono'", letterSpacing: "0.14em", fontWeight: 700, animation: "pulse 2s infinite", alignSelf: "flex-start" }}>
+                  ⚡ GENERATE DASHBOARD
+                </button>
               </div>
-            </div>
+            )}
+
+            {activeTab === "manual" && (
+              <div style={{ padding: "24px 26px", display: "flex", flexDirection: "column", gap: 20 }}>
+                <div style={{ fontSize: 9, color: "#555" }}>Edit any field directly. Changes take effect immediately.</div>
+                <div>
+                  <div style={{ fontSize: 9, color: GREEN, letterSpacing: "0.14em", marginBottom: 14 }}>CORE NUMBERS</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 14 }}>
+                    <EditField label="MONTHLY GOAL" value={data.monthlyGoal} onChange={v => update({ monthlyGoal: num(v) })} prefix="$" />
+                    <EditField label="NEW CASH" value={data.currentCash} onChange={v => update({ currentCash: num(v) })} prefix="$" />
+                    <EditField label="INSTALLMENTS" value={data.installments} onChange={v => update({ installments: num(v) })} prefix="$" />
+                    <EditField label="AVG DEAL" value={data.avgDeal} onChange={v => update({ avgDeal: num(v) })} prefix="$" />
+                    <EditField label="CLOSES" value={data.closes} onChange={v => update({ closes: num(v) })} />
+                  </div>
+                </div>
+                <div style={{ height: 1, background: BORDER }} />
+                <div>
+                  <div style={{ fontSize: 9, color: GREEN, letterSpacing: "0.14em", marginBottom: 14 }}>CALL METRICS</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 14 }}>
+                    <EditField label="TOTAL CALLS" value={data.totalCalls} onChange={v => update({ totalCalls: num(v) })} />
+                    <EditField label="SHOW UPS" value={data.showUps} onChange={v => update({ showUps: num(v) })} />
+                    <EditField label="NO SHOWS" value={data.noShows} onChange={v => update({ noShows: num(v) })} />
+                    <EditField label="SHOW RATE %" value={data.showRate} onChange={v => update({ showRate: num(v) })} />
+                    <EditField label="CLOSE RATE %" value={data.closeRate} onChange={v => update({ closeRate: num(v) })} />
+                  </div>
+                </div>
+                <div style={{ height: 1, background: BORDER }} />
+                <div>
+                  <div style={{ fontSize: 9, color: GREEN, letterSpacing: "0.14em", marginBottom: 14 }}>TIME & LABELS</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 }}>
+                    <EditField label="DAY OF MONTH" value={data.dayOfMonth} onChange={v => update({ dayOfMonth: num(v) })} small />
+                    <EditField label="DAYS IN MONTH" value={data.totalDaysInMonth} onChange={v => update({ totalDaysInMonth: num(v) })} small />
+                    <EditField label="MONTH NAME" value={data.month} onChange={v => update({ month: v })} />
+                    <EditField label="YEAR" value={data.year} onChange={v => update({ year: num(v) })} small />
+                  </div>
+                </div>
+                <div style={{ height: 1, background: BORDER }} />
+                <div>
+                  <div style={{ fontSize: 9, color: GREEN, letterSpacing: "0.14em", marginBottom: 14, display: "flex", justifyContent: "space-between" }}>
+                    <span>REP DATA</span>
+                    <button onClick={addRep} style={{ background: GREEN + "18", border: `1px solid ${GREEN}44`, color: GREEN, borderRadius: 6, padding: "4px 12px", fontSize: 9, cursor: "pointer", fontFamily: "'DM Mono'" }}>+ ADD REP</button>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                    {data.reps.map((rep, i) => (
+                      <div key={i} style={{ display: "grid", gridTemplateColumns: "140px 70px repeat(5,1fr) 28px", gap: 10, alignItems: "end", padding: "12px 14px", background: "#070707", borderRadius: 8, border: `1px solid ${BORDER}` }}>
+                        <EditField label="NAME" value={rep.name} onChange={v => updateRep(i, { name: v })} wide />
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                          <div style={{ fontSize: 8, color: "#666", letterSpacing: "0.1em" }}>TIER</div>
+                          <select value={rep.tier} onChange={e => updateRep(i, { tier: e.target.value as "top"|"mid"|"low" })}
+                            style={{ background: "#0a0a0a", border: `1px solid ${tierColor(rep.tier)}44`, color: tierColor(rep.tier), borderRadius: 6, padding: "6px 8px", fontSize: 10, fontFamily: "'DM Mono'", outline: "none", cursor: "pointer" }}>
+                            <option value="top">TOP</option>
+                            <option value="mid">AVG</option>
+                            <option value="low">LOW</option>
+                          </select>
+                        </div>
+                        <EditField label="CALLS" value={rep.calls} onChange={v => updateRep(i, { calls: num(v) })} />
+                        <EditField label="SHOWS" value={rep.shows} onChange={v => updateRep(i, { shows: num(v) })} />
+                        <EditField label="CLOSES" value={rep.closes} onChange={v => updateRep(i, { closes: num(v) })} />
+                        <EditField label="NEW CASH $" value={rep.revenue} onChange={v => updateRep(i, { revenue: num(v) })} />
+                        <EditField label="INSTALLMENT $" value={rep.installment} onChange={v => updateRep(i, { installment: num(v) })} />
+                        <button onClick={() => removeRep(i)} style={{ background: "transparent", border: `1px solid ${RED}22`, color: RED, borderRadius: 5, padding: "6px 4px", fontSize: 10, cursor: "pointer", height: 32 }}>✕</button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
+        {/* GOAL CARD */}
         <div className="fade" style={{ background: SURFACE, border: `1px solid ${BORDER}`, borderRadius: 14, padding: "22px 26px", position: "relative", overflow: "hidden", animationDelay: "0.04s" }}>
           <div style={{ position: "absolute", inset: 0, pointerEvents: "none", background: `linear-gradient(90deg, ${monthPct >= 50 ? GREEN : RED}0A 0%, transparent 55%)`, width: `${monthPct}%`, transition: "width 1.2s ease" }} />
           <div style={{ position: "relative", display: "flex", gap: 36, alignItems: "center" }}>
@@ -358,7 +609,7 @@ export default function ReserveDemoDashboard() {
                 <div style={{ height: "100%", borderRadius: 999, width: `${Math.min(monthPct, 100)}%`, background: monthPct >= 75 ? GREEN : monthPct >= 40 ? WHITE : RED, transition: "width 1.2s ease" }} />
               </div>
               <div style={{ display: "flex", gap: 28, marginTop: 14 }}>
-                {([["GAP", money(Math.max(0, data.monthlyGoal - totalCash))], ["CLOSES LEFT", closesNeeded], ["AVG DEAL", money(data.avgDeal)], ["CLOSES", data.closes]] as [string, string | number][]).map(([k, v]) => (
+                {([["GAP", money(Math.max(0, data.monthlyGoal - totalCash))], ["CLOSES LEFT", closesNeeded], ["AVG DEAL", money(data.avgDeal)], ["CLOSES", data.closes]] as [string, string|number][]).map(([k, v]) => (
                   <div key={k}><div style={{ fontSize: 8, color: WHITE, letterSpacing: "0.14em", marginBottom: 3 }}>{k}</div><div style={{ fontFamily: "'Syne', sans-serif", fontSize: 17, fontWeight: 700, color: WHITE }}>{v}</div></div>
                 ))}
               </div>
@@ -366,6 +617,7 @@ export default function ReserveDemoDashboard() {
           </div>
         </div>
 
+        {/* PACING CARD */}
         <div className="fade" style={{ background: SURFACE, border: `1px solid ${isAhead ? GREEN + "44" : RED + "44"}`, borderRadius: 14, padding: "20px 26px", animationDelay: "0.06s", position: "relative", overflow: "hidden" }}>
           <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 2, background: isAhead ? GREEN : RED }} />
           <div style={{ fontSize: 8, color: WHITE, letterSpacing: "0.14em", marginBottom: 12 }}>MONTH PACING — {data.month.toUpperCase()} {data.year}</div>
@@ -411,6 +663,7 @@ export default function ReserveDemoDashboard() {
           </div>
         </div>
 
+        {/* KPI STRIP */}
         <div className="fade" style={{ display: "grid", gridTemplateColumns: "repeat(6,1fr)", gap: 10, animationDelay: "0.08s" }}>
           <KpiCard label="TOTAL CALLS" value={data.totalCalls} sub="conducted" />
           <KpiCard label="SHOW UPS" value={data.showUps} sub={`${data.noShows} no-shows`} />
@@ -420,19 +673,22 @@ export default function ReserveDemoDashboard() {
           <KpiCard label="INSTALLMENTS" value={money(data.installments)} sub={data.month} />
         </div>
 
+        {/* BOTTOM GRID */}
         <div className="fade" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, animationDelay: "0.12s" }}>
           <div style={{ background: SURFACE, border: `1px solid ${BORDER}`, borderRadius: 14, padding: "20px 22px" }}>
             <div style={{ fontSize: 9, color: WHITE, letterSpacing: "0.14em", marginBottom: 18 }}>REP LEADERBOARD — {data.month.toUpperCase()}</div>
-            {data.reps.length === 0 && <div style={{ fontSize: 11, color: "#444" }}>No reps added yet — use Edit Mode to add.</div>}
+            {data.reps.length === 0 && <div style={{ fontSize: 11, color: "#444" }}>No reps — use Edit Mode to generate.</div>}
             <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
               {[...data.reps].sort((a, b) => (b.revenue + b.installment) - (a.revenue + a.installment)).map((r, i) => {
                 const cr = pct(r.closes, r.shows); const sr = pct(r.shows, r.calls); const repTotal = r.revenue + r.installment;
+                const tc = tierColor(r.tier);
                 return (
                   <div key={i}>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 7 }}>
                       <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
                         <span style={{ fontSize: 9, color: i === 0 ? GREEN : WHITE, fontWeight: 500 }}>#{i + 1}</span>
                         <span style={{ fontFamily: "'Syne', sans-serif", fontWeight: 700, fontSize: 15, color: WHITE }}>{r.name}</span>
+                        <span style={{ fontSize: 7, color: tc, border: `1px solid ${tc}44`, borderRadius: 4, padding: "1px 5px", letterSpacing: "0.1em" }}>{tierLabel(r.tier)}</span>
                       </div>
                       <div style={{ display: "flex", gap: 12, alignItems: "baseline" }}>
                         <span style={{ fontSize: 10, color: "#555" }}>{money(r.revenue)} new · {money(r.installment)} inst.</span>
@@ -441,7 +697,7 @@ export default function ReserveDemoDashboard() {
                     </div>
                     <Bar value={repTotal} max={maxRepRev} color={i === 0 ? GREEN : "#282828"} h={3} />
                     <div style={{ display: "flex", gap: 14, marginTop: 8, flexWrap: "wrap" }}>
-                      {([{ k: "Calls", v: r.calls, c: null }, { k: "Shows", v: r.shows, c: null }, { k: "Closes", v: r.closes, c: null }, { k: "Show%", v: sr + "%", c: sr >= 70 ? GREEN : RED }, { k: "CR%", v: cr + "%", c: cr >= 25 ? GREEN : RED }] as { k: string; v: string | number; c: string | null }[]).map(({ k, v, c }) => (
+                      {([{ k: "Calls", v: r.calls, c: null }, { k: "Shows", v: r.shows, c: null }, { k: "Closes", v: r.closes, c: null }, { k: "Show%", v: sr + "%", c: sr >= 70 ? GREEN : RED }, { k: "CR%", v: cr + "%", c: cr >= 25 ? GREEN : RED }] as { k: string; v: string|number; c: string|null }[]).map(({ k, v, c }) => (
                         <div key={k} style={{ fontSize: 10, color: WHITE }}>{k} <span style={{ color: c || "#999" }}>{v}</span></div>
                       ))}
                     </div>
